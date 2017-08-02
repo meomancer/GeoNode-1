@@ -25,16 +25,22 @@ import shutil
 import traceback
 import uuid
 import decimal
+import datetime
+import tempfile
+import subprocess
+import StringIO
+import zipfile
 
 from guardian.shortcuts import get_perms
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.urlresolvers import reverse
-from django.http import HttpResponse, HttpResponseRedirect
+from django.http import HttpResponse, HttpResponseRedirect, Http404
 from django.shortcuts import render_to_response
 from django.conf import settings
 from django.template import RequestContext
 from django.utils.translation import ugettext as _
+
 try:
     import json
 except ImportError:
@@ -214,6 +220,135 @@ def layer_upload(request, template='upload/layer_upload.html'):
             status=status_code)
 
 
+def download_clip(request, layername):
+    """Ship and clip.
+    Clipping layer by bbox or by geojson.
+    :param layername: The layer name in Geonode.
+    :type layername: basestring
+    :return: The HTTPResponse with a file.
+    """
+    # PREPARATION
+    layer = _resolve_layer(
+        request,
+        layername,
+        'base.view_resourcebase',
+        _PERMISSION_MSG_VIEW)
+
+    query = request.GET or request.POST
+    params = {
+        param.upper(): value for param, value in query.iteritems()}
+    bbox_string = params.get('BBOX', '')
+    geojson = params.get('GEOJSON', '')
+    current_date = datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S')
+
+    # create temp folder
+    temporary_folder = os.path.join(
+        tempfile.gettempdir(), 'clipped')
+    try:
+        os.mkdir(temporary_folder)
+    except OSError as e:
+        pass
+
+    # get file for raster
+    raster_filepath = None
+    extention = ''
+
+    file_names = []
+    for layerfile in layer.upload_session.layerfile_set.all():
+        file_names.append(layerfile.file.url)
+
+    for target_file in file_names:
+        if '.tif' in target_file:
+            raster_filepath = target_file
+            extention = 'tif'
+            break
+
+    # get temp filename for output
+    filename = os.path.basename(raster_filepath)
+    clip_filename = filename + '.' + current_date + '.' + extention
+
+    if bbox_string:
+        output = os.path.join(
+            temporary_folder,
+            clip_filename
+        )
+        clipping = (
+            'gdal_translate -projwin ' +
+            '%(CLIP)s %(PROJECT)s %(OUTPUT)s'
+        )
+        request_process = clipping % {
+            'CLIP': bbox_string.replace(',', ' '),
+            'PROJECT': raster_filepath,
+            'OUTPUT': output,
+        }
+    elif geojson:
+        output = os.path.join(
+            temporary_folder,
+            clip_filename
+        )
+        mask_file = os.path.join(
+            temporary_folder,
+            filename + '.' + current_date + '.geojson'
+        )
+        _file = open(mask_file, 'w+')
+        _file.write(geojson)
+        _file.close()
+
+        masking = ('gdalwarp -dstnodata 0 -q -cutline %(MASK)s ' +
+                   '-crop_to_cutline ' +
+                   '-dstalpha -tr 0.0165975103734 0.0165975103734 -of ' +
+                   'GTiff %(PROJECT)s %(OUTPUT)s')
+        request_process = masking % {
+            'MASK': mask_file,
+            'PROJECT': raster_filepath,
+            'OUTPUT': output,
+        }
+    else:
+        raise Http404('No bbox or geojson in parameters.')
+
+    # generate if output is not created
+    if not os.path.exists(output):
+        if raster_filepath:
+            subprocess.call(request_process, shell=True)
+
+    if os.path.exists(output):
+        # Create zip file
+        s = StringIO.StringIO()
+        zf = zipfile.ZipFile(s, "w")
+
+        zip_subdir = layer.name + '_clipped'
+        zip_filename = "%s.zip" % zip_subdir
+
+        files_to_zipped = []
+        for filename in file_names:
+            if not filename.endswith('.qgs') and \
+                    not filename.endswith(extention):
+                files_to_zipped.append(filename)
+
+        for fpath in files_to_zipped:
+            # Calculate path for file in zip
+            fdir, fname = os.path.split(fpath)
+            fnames = fname.split('.')
+            fname = fnames[0] + '.' + current_date + '.' + fnames[1]
+            zip_path = os.path.join(zip_subdir, fname)
+            zf.write(fpath, zip_path)
+
+        # Add clipped raster
+        opath, oname = os.path.split(output)
+        zip_path = os.path.join(zip_subdir, oname)
+        zf.write(output, zip_path)
+
+        # Must close zip for all contents to be written
+        zf.close()
+
+        resp = HttpResponse(
+            s.getvalue(), content_type="application/x-zip-compressed")
+        resp['Content-Disposition'] = 'attachment; filename=%s' % zip_filename
+        return resp
+    else:
+        raise Http404('Project can not be clipped or masked.')
+
+
 def layer_detail(request, layername, template='layers/layer_detail.html'):
     layer = _resolve_layer(
         request,
@@ -313,7 +448,7 @@ def layer_detail(request, layername, template='layers/layer_detail.html'):
         access_token = u.hex
 
     context_dict["viewer"] = json.dumps(
-        map_obj.viewer_json(request.user, access_token, * (NON_WMS_BASE_LAYERS + [maplayer])))
+        map_obj.viewer_json(request.user, access_token, *(NON_WMS_BASE_LAYERS + [maplayer])))
     context_dict["preview"] = getattr(
         settings,
         'LAYER_PREVIEW_LIBRARY',
@@ -494,7 +629,7 @@ def layer_metadata(request, layername, template='layers/layer_metadata.html'):
             the_layer.metadata_author = new_author
             Layer.objects.filter(id=the_layer.id).update(
                 category=new_category
-                )
+            )
 
             if getattr(settings, 'SLACK_ENABLED', False):
                 try:
