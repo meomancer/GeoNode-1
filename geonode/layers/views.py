@@ -255,7 +255,7 @@ def download_clip(request, layername):
 
     file_names = []
     for layerfile in layer.upload_session.layerfile_set.all():
-        file_names.append(layerfile.file.url)
+        file_names.append(layerfile.file.path)
 
     for target_file in file_names:
         if '.tif' in target_file:
