@@ -26,7 +26,11 @@ from owslib.iso import MD_Metadata
 from pycsw import server
 from geonode.catalogue.backends.generic import CatalogueBackend as GenericCatalogueBackend
 from geonode.catalogue.backends.generic import METADATA_FORMATS
-from shapely.geometry.base import ReadingError
+
+try:
+    from shapely.errors import ReadingError
+except:
+    from shapely.geos import ReadingError
 
 true_value = 'true'
 if 'sqlite' in settings.DATABASES['default']['ENGINE']:
